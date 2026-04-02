@@ -1,59 +1,70 @@
- #!/data/data/com.termux/files/usr/bin/bash
+#!/data/data/com.termux/files/usr/bin/bash
 set -euo pipefail
 
-# === SPeCK LLM Bridge – Max OPSEC Installer ===
+# === SPeCK LLM Bridge – MAX OPSEC Hardened Installer ===
 # Usage: bash install-bridge.sh
-# After install, copy the shown key into SPCK.
+# After install, copy the shown key into your SPCK JS console.
 
 GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m'
 
-echo -e "${GREEN}▶ Installing SPeCK LLM Bridge (hardened)${NC}"
+echo -e "${GREEN}▶ Installing SPeCK LLM Bridge (MAX OPSEC edition)${NC}"
 
 # 1. System dependencies
+echo -e "${YELLOW}→ Updating packages and installing build deps...${NC}"
 pkg update -y
-pkg install -y curl clang openssl-tool
+pkg install -y curl clang openssl-tool git make libclang
 
-# 2. Install rustup (official)
+# 2. Install rustup (official, minimal)
 if ! command -v rustc &>/dev/null; then
+    echo -e "${YELLOW}→ Installing Rust (minimal profile)...${NC}"
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
     source "$HOME/.cargo/env"
     echo 'source "$HOME/.cargo/env"' >> ~/.bashrc
 fi
+source "$HOME/.cargo/env"
 
-# 3. Add Android target and configure linker
+# 3. Android target + hardened linker config
 rustup target add aarch64-linux-android
 mkdir -p ~/.cargo
 cat > ~/.cargo/config.toml << 'EOF'
 [target.aarch64-linux-android]
 linker = "clang"
-rustflags = ["-C", "target-cpu=native", "-C", "link-arg=-z", "-C", "link-arg=now", "-C", "link-arg=-z", "-C", "link-arg=relro"]
+rustflags = [
+    "-C", "target-cpu=native",
+    "-C", "link-arg=-z", "-C", "link-arg=now",
+    "-C", "link-arg=-z", "-C", "link-arg=relro",
+    "-C", "link-arg=-z", "-C", "link-arg=nocopyreloc"
+]
 EOF
 
-# 4. Create project directory
+# 4. Project directory
 PROJECT="$HOME/spck-llm-bridge"
 mkdir -p "$PROJECT/src"
 cd "$PROJECT"
 
-# 5. Write Cargo.toml (hardened)
+# 5. Hardened Cargo.toml
 cat > Cargo.toml << 'EOF'
 [package]
 name = "spck-llm-bridge"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
+authors = ["SPeCK User"]
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 axum = "0.7"
-tokio = { version = "1", features = ["rt", "net", "macros", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "signal"] }
 tower = "0.4"
-tower-http = { version = "0.5", features = ["trace", "limit"] }
+tower-http = { version = "0.5", features = ["trace", "limit", "cors"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
-reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls-native-roots"] }
 http-body-util = "0.1"
 bytes = "1"
 anyhow = "1"
@@ -61,6 +72,7 @@ clap = { version = "4", features = ["derive"] }
 sha2 = "0.10"
 subtle = "2.5"
 once_cell = "1"
+hex = "0.4"
 
 [profile.release]
 opt-level = "z"
@@ -69,9 +81,10 @@ codegen-units = 1
 strip = "symbols"
 panic = "abort"
 overflow-checks = true
+debug = false
 EOF
 
-# 6. Write config.rs
+# 6. Config
 cat > src/config.rs << 'EOF'
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -88,7 +101,7 @@ pub struct Config {
 
 impl Config {
     pub fn from_file(path: &PathBuf) -> anyhow::Result<Self> {
-        let contents = std::fs::read_to_string(path)?;
+        let contents = std::fs::read_to_string(path).context("Failed to read config")?;
         let mut cfg: Config = toml::from_str(&contents)?;
         cfg.validate()?;
         Ok(cfg)
@@ -96,46 +109,68 @@ impl Config {
 
     pub fn validate(&self) -> anyhow::Result<()> {
         let host = self.bind.split(':').next().unwrap_or("");
-        if host != "127.0.0.1" && host != "localhost" {
-            bail!("Bind must be loopback (127.0.0.1/localhost)");
+        if !matches!(host, "127.0.0.1" | "localhost") {
+            bail!("Bind address must be loopback only (127.0.0.1 or localhost) for OPSEC");
         }
         if self.max_body_kb == 0 || self.max_body_kb > 1024 {
-            bail!("max_body_kb 1..1024");
+            bail!("max_body_kb must be between 1 and 1024");
+        }
+        if self.auth_key_hash.len() != 64 {
+            bail!("auth_key_hash must be a valid SHA-256 hex string");
         }
         Ok(())
     }
 }
 EOF
 
-# 7. Write auth.rs (constant‑time)
+# 7. Constant-time auth
+# FIX: axum 0.7 dropped the <B> generic on Next — signature is now (Request, Next) -> Response
 cat > src/auth.rs << 'EOF'
 use subtle::ConstantTimeEq;
 use sha2::{Sha256, Digest};
-use axum::{http::{Request, StatusCode}, middleware::Next, response::Response};
+use axum::{
+    extract::Request,
+    http::StatusCode,
+    middleware::Next,
+    response::Response,
+};
 use tracing::warn;
 use once_cell::sync::OnceCell;
 use crate::config::Config;
 
 pub static CONFIG: OnceCell<Config> = OnceCell::new();
 
-pub async fn auth_middleware<B>(req: Request<B>, next: Next<B>) -> Result<Response, StatusCode> {
+pub async fn auth_middleware(req: Request, next: Next) -> Result<Response, StatusCode> {
     let cfg = CONFIG.get().ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
-    let key = req.headers().get("X-Bridge-Key").and_then(|v| v.to_str().ok()).unwrap_or("");
-    let hash = hex::encode(Sha256::digest(key.as_bytes()));
+
+    let key = req
+        .headers()
+        .get("X-Bridge-Key")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    let provided_hash = hex::encode(Sha256::digest(key.as_bytes()));
     let expected = cfg.auth_key_hash.as_bytes();
-    let provided = hash.as_bytes();
-    if bool::from(expected.ct_eq(provided)) {
+
+    if bool::from(expected.ct_eq(provided_hash.as_bytes())) {
         Ok(next.run(req).await)
     } else {
-        warn!("Auth failed (timing-safe)");
+        warn!("Authentication failed (constant-time comparison)");
         Err(StatusCode::UNAUTHORIZED)
     }
 }
 EOF
 
-# 8. Write proxy.rs
+# 8. Proxy handler
+# FIX: Do NOT extract Path(path) from the route — named routes like /v1/chat/completions
+# have no {path} segment so axum panics at extraction time. Use OriginalUri instead,
+# which captures the full request URI regardless of which route matched.
 cat > src/proxy.rs << 'EOF'
-use axum::{extract::State, http::{Method, StatusCode}, response::{IntoResponse, Response}};
+use axum::{
+    extract::{OriginalUri, State},
+    http::{Method, StatusCode},
+    response::{IntoResponse, Response},
+};
 use bytes::Bytes;
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -149,18 +184,33 @@ pub struct AppState {
 pub async fn proxy_handler(
     State(state): State<Arc<AppState>>,
     method: Method,
-    path: String,
+    OriginalUri(uri): OriginalUri,
     headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Response {
-    let url = format!("{}{}", state.backend_url, path);
+    let path_and_query = uri
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/");
+
+    let url = format!(
+        "{}{}",
+        state.backend_url.trim_end_matches('/'),
+        path_and_query
+    );
+
     let mut req = state.client.request(method, &url);
+
     for (name, value) in headers.iter() {
-        let name = name.as_str();
-        if !matches!(name, "host" | "connection" | "content-length" | "x-bridge-key") {
+        let name_str = name.as_str().to_lowercase();
+        if !matches!(
+            name_str.as_str(),
+            "host" | "connection" | "content-length" | "x-bridge-key" | "upgrade"
+        ) {
             req = req.header(name, value);
         }
     }
+
     match req.body(body).send().await {
         Ok(resp) => {
             let status = resp.status();
@@ -169,35 +219,46 @@ pub async fn proxy_handler(
                 builder = builder.header(k, v);
             }
             let bytes = resp.bytes().await.unwrap_or_default();
+
             if state.log_redact && !bytes.is_empty() {
-                info!("Response (redacted): {} bytes", bytes.len());
+                info!("Proxied response: {} bytes (content redacted)", bytes.len());
+            } else if !state.log_redact {
+                info!("Proxied response: {} bytes", bytes.len());
             }
-            builder.body(bytes.into()).unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+
+            builder
+                .body(axum::body::Body::from(bytes))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
         }
         Err(e) => {
-            warn!("Proxy error: {}", e);
-            (StatusCode::BAD_GATEWAY, e.to_string()).into_response()
+            warn!("Proxy error to backend: {}", e);
+            (StatusCode::BAD_GATEWAY, format!("Backend error: {}", e)).into_response()
         }
     }
 }
 EOF
 
-# 9. Write main.rs
+# 9. Main.rs
+# FIX 1: Collapse all specific named routes + wildcard into a single "/*path" any() route.
+#         The named routes were redundant (/*path catches everything) AND broken because
+#         the handler uses OriginalUri now, not Path extraction.
+# FIX 2: Clap Serve subcommand config field needs #[arg(long)] so --config flag works.
+#         Previously it was positional, but start-bridge.sh called `serve --config <path>`.
 cat > src/main.rs << 'EOF'
 mod config;
 mod auth;
 mod proxy;
 
-use axum::{Router, middleware, routing::{any, post, get}};
+use axum::{Router, middleware, routing::any};
 use clap::{Parser, Subcommand};
 use std::{net::SocketAddr, sync::Arc};
 use tower_http::limit::RequestBodyLimitLayer;
 use tracing::info;
 use tracing_subscriber::fmt::format::FmtSpan;
-use crate::config::Config;
 use crate::auth::auth_middleware;
 
 #[derive(Parser)]
+#[command(name = "spck-llm-bridge", version, about = "Hardened LLM proxy bridge for SPCK/Termux")]
 struct Cli {
     #[command(subcommand)]
     cmd: Commands,
@@ -205,58 +266,92 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    Serve { config: String },
-    HashKey { key: String },
+    /// Start the proxy bridge
+    Serve {
+        /// Path to TOML config file
+        #[arg(long, short = 'c')]
+        config: String,
+    },
+    /// Print the SHA-256 hash of a key (for config generation)
+    HashKey {
+        /// The plaintext key to hash
+        key: String,
+    },
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter("spck_llm_bridge=info")
+        .with_env_filter("spck_llm_bridge=info,reqwest=warn")
         .with_span_events(FmtSpan::CLOSE)
         .json()
         .init();
+
     let cli = Cli::parse();
+
     match cli.cmd {
         Commands::Serve { config } => {
-            let cfg = Config::from_file(&std::path::PathBuf::from(&config))?;
-            auth::CONFIG.set(cfg.clone()).unwrap();
+            let cfg = config::Config::from_file(&std::path::PathBuf::from(&config))?;
+            auth::CONFIG.set(cfg.clone()).expect("Failed to set global config");
+
             let state = Arc::new(proxy::AppState {
                 client: reqwest::Client::builder()
                     .use_rustls_tls()
+                    .timeout(std::time::Duration::from_secs(120))
                     .build()?,
-                backend_url: cfg.backend_url,
+                backend_url: cfg.backend_url.clone(),
                 log_redact: cfg.log_redact_content,
             });
+
             let app = Router::new()
-                .route("/v1/chat/completions", post(proxy::proxy_handler))
-                .route("/v1/completions", post(proxy::proxy_handler))
-                .route("/api/generate", post(proxy::proxy_handler))
-                .route("/api/tags", get(proxy::proxy_handler))
+                // Single wildcard route — OriginalUri in handler preserves the full path.
+                // More specific routes would be redundant and caused Path extractor panics.
                 .route("/*path", any(proxy::proxy_handler))
                 .layer(middleware::from_fn(auth_middleware))
                 .layer(RequestBodyLimitLayer::new(cfg.max_body_kb * 1024))
                 .with_state(state);
+
             let addr: SocketAddr = cfg.bind.parse()?;
-            info!("Listening on http://{}", addr);
-            axum::serve(tokio::net::TcpListener::bind(addr).await?, app).await?;
+            info!("🚀 SPeCK Bridge listening on http://{}", addr);
+            info!("Backend: {}", cfg.backend_url);
+
+            let listener = tokio::net::TcpListener::bind(addr).await?;
+            axum::serve(listener, app).await?;
         }
+
         Commands::HashKey { key } => {
             let hash = hex::encode(sha2::Sha256::digest(key.as_bytes()));
             println!("{}", hash);
         }
     }
+
     Ok(())
 }
 EOF
 
-# 10. Build release binary
-echo -e "${GREEN}▶ Building hardened binary (first time: 2‑4 min)${NC}"
-cargo build --release
+# 10. Build
+echo -e "${GREEN}▶ Building hardened release binary (may take 2–5 min first time)...${NC}"
+cargo build --release --target aarch64-linux-android || {
+    echo -e "${RED}→ Android-targeted build failed; retrying without explicit target...${NC}"
+    cargo build --release
+}
 
-# 11. Generate random key (display only once)
-RANDOM_KEY=$(openssl rand -hex 32)
-HASH=$(./target/release/spck-llm-bridge hash-key "$RANDOM_KEY")
+# Locate binary (host build first, then cross-compiled)
+BINARY="$PROJECT/target/release/spck-llm-bridge"
+if [ ! -f "$BINARY" ]; then
+    BINARY="$PROJECT/target/aarch64-linux-android/release/spck-llm-bridge"
+fi
+if [ ! -f "$BINARY" ]; then
+    echo -e "${RED}Binary not found after build — check cargo output above.${NC}"
+    exit 1
+fi
+chmod +x "$BINARY"
+
+# 11. Generate strong random key + config
+echo -e "${YELLOW}→ Generating strong random auth key...${NC}"
+RANDOM_KEY=$(openssl rand -hex 48)
+HASH=$("$BINARY" hash-key "$RANDOM_KEY")
+
 mkdir -p "$HOME/.config/spck-bridge"
 CONFIG_FILE="$HOME/.config/spck-bridge/config.toml"
 cat > "$CONFIG_FILE" <<EOF
@@ -268,52 +363,104 @@ log_redact_content = true
 EOF
 chmod 600 "$CONFIG_FILE"
 
-# 12. Generate SPCK plugin with key embedded
-PLUGIN_FILE="$PROJECT/plugin.js"
+# 12. Start helper script
+# FIX: Use --config flag (long arg) matching the #[arg(long)] Clap definition above.
+cat > "$PROJECT/start-bridge.sh" <<EOF
+#!/data/data/com.termux/files/usr/bin/bash
+cd "$PROJECT"
+RUST_LOG=info exec "$BINARY" serve --config "$CONFIG_FILE"
+EOF
+chmod +x "$PROJECT/start-bridge.sh"
+
+# 13. SPCK Plugin (hardened)
+# FIX: reviewCode() called bare `generate(...)` which is out of scope inside the IIFE.
+#      Must call `call('/api/generate', ...)` directly or use the returned object ref.
+#      Restructured so all methods reference `call` via closure (already in scope).
+PLUGIN_FILE="$PROJECT/spck-plugin.js"
 cat > "$PLUGIN_FILE" <<EOF
-// === SPeCK LLM Bridge Plugin (OPSEC hardened) ===
-// Paste into SPCK JS console, then run: LLM.setKey()
-window.LLM = (() => {
-    let key = null;
-    const url = 'http://127.0.0.1:3030';
-    const setKey = (k) => { key = k; };
-    const call = async (endpoint, body) => {
-        if (!key) throw new Error('Call LLM.setKey("$RANDOM_KEY") first');
-        const r = await fetch(url + endpoint, {
+// === SPeCK LLM Bridge Plugin (MAX OPSEC) ===
+// Paste into SPCK JS console or save as a snippet.
+
+window.SPeCKLLM = (() => {
+    const BASE_URL = 'http://127.0.0.1:3030';
+    let secretKey = null;
+
+    const setKey = (k) => {
+        if (!k || k.length < 20) throw new Error('Invalid key — must be 20+ chars');
+        secretKey = k;
+        console.log('✅ SPeCKLLM key set');
+    };
+
+    const call = async (endpoint, body, model = 'llama3.2') => {
+        if (!secretKey) throw new Error('Call SPeCKLLM.setKey("your-key") first');
+        const payload = { ...body, model };
+        const res = await fetch(BASE_URL + endpoint, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'X-Bridge-Key': key },
-            body: JSON.stringify(body)
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Bridge-Key': secretKey,
+            },
+            body: JSON.stringify(payload),
         });
-        if (!r.ok) throw new Error(await r.text());
-        return r.json();
+        if (!res.ok) {
+            const err = await res.text().catch(() => '(no body)');
+            throw new Error(\`LLM bridge error (\${res.status}): \${err}\`);
+        }
+        return res.json();
     };
-    const complete = (prompt, model='llama3') => call('/v1/completions', { model, prompt });
-    const chat = (messages, model='llama3') => call('/v1/chat/completions', { model, messages });
-    const generate = (prompt, model='llama3') => call('/api/generate', { model, prompt }).then(j => j.response);
-    const review = async () => {
-        const editor = monaco?.editor?.getModels()[0]?.getEditor?.() || document.querySelector('.monaco-editor')?.__editor;
-        if (!editor) throw new Error('No Monaco editor');
-        const code = editor.getValue();
-        return await generate(\`Code review:\n\` + code);
+
+    // FIX: reviewCode previously called bare generate() which is not in scope inside an
+    // IIFE returning an object literal. It now calls call() directly, which IS in scope.
+    const reviewCode = async (model = 'llama3.2') => {
+        const editor =
+            window.monaco?.editor?.getModels()?.[0] ||
+            document.querySelector('.monaco-editor')?.__monaco_editor;
+        if (!editor) throw new Error('No Monaco editor found on page');
+        const code = typeof editor.getValue === 'function'
+            ? editor.getValue()
+            : editor.getModel?.().getValue?.() ?? '';
+        if (!code.trim()) throw new Error('Editor appears to be empty');
+        const result = await call(
+            '/api/generate',
+            { prompt: \`Review this code for bugs, improvements, and best practices:\n\n\${code}\` },
+            model,
+        );
+        return result.response ?? result;
     };
-    return { setKey, complete, chat, generate, review };
+
+    return {
+        setKey,
+        chat:     (messages, model = 'llama3.2') =>
+                      call('/v1/chat/completions', { messages }, model),
+        complete: (prompt, model = 'llama3.2') =>
+                      call('/v1/completions', { prompt }, model),
+        generate: (prompt, model = 'llama3.2') =>
+                      call('/api/generate', { prompt }, model).then(r => r.response ?? r),
+        reviewCode,
+    };
 })();
-// Set your key:
-LLM.setKey("$RANDOM_KEY");
+
+// Auto-inject the key generated during install:
+SPeCKLLM.setKey("$RANDOM_KEY");
+console.log('🚀 SPeCKLLM ready! Try: SPeCKLLM.chat([{role:"user",content:"Hello"}])');
+console.log('                   Or:   SPeCKLLM.reviewCode()');
 EOF
 
 echo -e "${GREEN}✅ Installation complete!${NC}"
-echo "────────────────────────────────────────────"
-echo -e "${GREEN}🔑 YOUR SECRET KEY (store safely):${NC} $RANDOM_KEY"
-echo -e "${GREEN}📁 Config:${NC} $CONFIG_FILE"
-echo -e "${GREEN}📜 Plugin:${NC} $PLUGIN_FILE"
+echo "────────────────────────────────────────────────────────────"
+echo -e "${GREEN}🔑 YOUR SECRET KEY (store securely, never share):${NC}"
+echo -e "${YELLOW}$RANDOM_KEY${NC}"
 echo ""
-echo "To start the bridge:"
-echo "  cd $PROJECT && RUST_LOG=info ./target/release/spck-llm-bridge serve --config $CONFIG_FILE"
+echo -e "${GREEN}📁 Config:${NC}      $CONFIG_FILE"
+echo -e "${GREEN}📜 Plugin:${NC}      $PLUGIN_FILE"
+echo -e "${GREEN}▶  Start:${NC}       $PROJECT/start-bridge.sh"
 echo ""
-echo "Make sure Ollama is running:"
-echo "  ollama serve &"
-echo "  ollama pull tinyllama"
+echo "Steps to use:"
+echo "  1. ollama serve &"
+echo "  2. ollama pull llama3.2   (or: tinyllama for speed)"
+echo "  3. $PROJECT/start-bridge.sh"
+echo "  4. In SPCK console: paste contents of $PLUGIN_FILE"
+echo "     Then: SPeCKLLM.chat([{role:'user', content:'Hello'}])"
 echo ""
-echo "In SPCK, paste the contents of $PLUGIN_FILE into the JS console."
-echo "────────────────────────────────────────────"
+echo -e "${YELLOW}Tip:${NC} Keep everything on 127.0.0.1. Never expose port 3030 externally."
+echo "────────────────────────────────────────────────────────────"
